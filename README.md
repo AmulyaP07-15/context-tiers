@@ -1,104 +1,303 @@
 # context-tiers
 
-[![ci](https://github.com/AmulyaP07-15/context-tiers/actions/workflows/ci.yml/badge.svg)](https://github.com/AmulyaP07-15/context-tiers/actions)
+**Context management for AI agents under a fixed token budget.**
 
 A context window is less a budget problem than an engineering one. Raising the token limit does not fix an agent that keeps the wrong things. What matters is the logic that decides what stays.
 
-This is a library for that logic. It decides what an AI agent keeps in memory when it runs out of room.
+`context-tiers` is a context-management library that allocates a fixed token budget across agent history based on the value of each piece of information. Instead of blindly dropping the oldest messages, it protects information that can change the outcome of a task and removes information that is cheaper to lose.
 
 ```bash
 pip install context-tiers
 ```
 
-## Why this exists
+## Why
 
-When an agent's context window fills up, most agents delete the oldest messages. Sometimes the oldest message was "pay with miles, not the card." It gets dropped, the agent charges the card, the task fails, and nobody sees why.
+Most agents handle context overflow by deleting the oldest messages.
 
-Deleting by age is easy to build and quietly wrong. The thing you need to keep is rarely the newest thing. It is the constraint the customer stated, the account id the next tool call needs, the policy the agent must follow. This library keeps those and sheds the rest.
+That sounds reasonable until the oldest message contains something like this.
+
+> "Pay with miles, not the card."
+
+If that message disappears, the agent can make the wrong payment decision, fail the task, and leave no obvious explanation for why.
+
+The information worth keeping is rarely determined by recency alone.
+
+`context-tiers` treats context as a **resource-allocation problem**.
 
 ## How it works
 
-Every piece of context is treated as a kind of thing, not just as text, and each kind is handled on its own terms. Rules never get touched. Hard customer requirements get detected and protected. Recent turns stay word for word. Old tool results get shortened but keep their key fields like ids and payment records. Old small talk gets trimmed first, because losing it costs the least.
+Different types of information receive different treatment.
 
-Each category gets a priority tier, and a fixed token budget is spent down the tiers until it runs out.
+| Content | Treatment |
+|---|---|
+| System rules | Never removed |
+| Hard customer constraints | Detected and protected |
+| Recent conversation | Preserved verbatim |
+| Old tool results | Compressed field-by-field |
+| Old small talk | Dropped first |
+
+Each category receives a priority tier. A fixed token budget is then allocated from the highest-priority information downward until the budget is exhausted.
 
 ```python
 from context_tiers import ContextManager
 
 cm = ContextManager(budget=6000)
-cm.add("system", "You are a booking agent. Refunds go to the original payment method.")
-cm.add("user", "Pay with miles, not the credit card.")   # detected and protected
+
+cm.add(
+    "system",
+    "You are a booking agent. Refunds go to the original payment method."
+)
+
+cm.add(
+    "user",
+    "Pay with miles, not the credit card."
+)
+
 messages, trace = cm.build(trace=True)
 ```
 
-Every build explains itself. The trace records what was kept, shortened, or dropped, with the token math, and for each shortened tool result it lists which fields survived and which were cut.
+The result is an OpenAI-compatible message history that fits the requested budget.
 
-## How it was tested
+The manager can also produce a structured trace explaining which content was kept, compressed, or dropped and how the token budget was allocated.
 
-The library was wired into tau-bench, the agent benchmark Sierra publishes for customer service tasks. Two agents run the same airline tasks under the same token budget. One deletes oldest. One uses this library. The model and the tasks are held fixed, so the only thing that changes is how memory is managed.
+## Architecture
 
-Building a fair comparison meant getting the measurement honest first, and that surfaced three problems worth fixing. The budget was not counting the tool schemas sent on every request, so the real budget was far smaller than the number set. Compression was keeping the front of a JSON record and dropping the back, which lost a payment id sitting late in a reservation. And the old history was being flattened into a single user message, which told the model the customer had said things the tools actually returned. Each fix is now a property the library guarantees and a test that locks it in.
+```text
+                         Conversation History
+                                  │
+                                  ▼
+                       ┌─────────────────────┐
+                       │   Context Manager   │
+                       └──────────┬──────────┘
+                                  │
+                 ┌────────────────┼────────────────┐
+                 │                │                │
+                 ▼                ▼                ▼
+          Constraint           Recency          Content
+            Pinner             Analysis        Classification
+                 │                │                │
+                 └────────────────┼────────────────┘
+                                  ▼
+                         ┌─────────────────┐
+                         │ Tier Allocator  │
+                         └────────┬────────┘
+                                  │
+                    ┌─────────────┼─────────────┐
+                    │             │             │
+                    ▼             ▼             ▼
+                  KEEP        COMPRESS        DROP
+                    │             │         (discarded)
+                    │       Field-aware
+                    │       compression
+                    │             │
+                    └──────┬──────┘
+                           ▼
+                    Final Context Budget
+                           │
+                           ▼
+                       Agent / LLM
+```
 
-Both agents share the same short operating instruction, which tells them to look information up rather than interrogate the customer and to act once they have what a task requires. This is applied identically to both conditions, so it does not favor either one. It exists because a small model left to its own devices tends to stall in clarifying questions until the simulated customer gives up, which is a failure of prompting rather than of memory, and holding it constant lets the comparison measure what it is meant to measure. Episodes run to a fixed step budget.
+The important distinction is that compression is **not purely textual**.
 
-## Result
+For structured tool results, the compressor reasons about individual fields so important values such as reservation IDs, payment records, and other identifiers can survive even when the surrounding response is shortened.
 
-Twenty episodes, five airline tasks, two attempts each, run on gpt-5-mini as the agent with tiered management versus naive delete-oldest under a shared 6000 token budget.
+## Design principles
 
-| condition | tasks solved (pass^1) | solved on both attempts (pass^2) | avg steps | avg total context |
-|-----------|----------------------|----------------------------------|-----------|-------------------|
-| tiered management | 0.60 | 0.40 | 22.5 | 122k |
-| naive truncation | 0.20 | 0.00 | 19.3 | 104k |
+### 1. Protect decisions, not just recent messages
 
-![results chart](results_chart.png)
+A hard customer constraint can be more important than a recent conversational turn.
 
-Raw report output:
+The manager therefore detects constraints such as these.
+
+```text
+"Pay with miles, not the credit card."
+"Don't change the first reservation."
+"Refund the original payment method."
+```
+
+and protects the information required to act on them.
+
+### 2. Compress structured data intelligently
+
+Naively truncating JSON can remove the one field an agent actually needs.
+
+Instead, tool results are compressed at the field level so important identifiers and state can survive while low-value fields are removed.
+
+### 3. Spend the budget deliberately
+
+The system does not assume that every token in the history has equal value.
+
+When the budget is constrained, higher-priority information gets the available space first.
+
+### 4. Make allocation decisions inspectable
+
+Every build can produce a trace containing the allocation decisions and token accounting.
+
+This makes context management observable rather than an opaque preprocessing step.
+
+## Evaluation on tau-bench
+
+The system was integrated with [tau-bench](https://github.com/sierra-research/tau-bench), Sierra's benchmark for tool-using customer-service agents.
+
+Two agents run the same airline customer-service tasks under the same model and context budget.
+
+- **Tiered management** uses `context-tiers`
+- **Naive truncation** removes oldest messages first
+
+The model, tasks, budget, and prompting were held constant so the primary difference was the context-management strategy.
+
+### Benchmark setup
+
+- **20 episodes**
+- **5 airline customer-service tasks**
+- **2 attempts per task**
+- **gpt-5-mini**
+- **6,000-token shared context budget**
+
+The benchmark also counts tool schemas as part of the context budget. These account for roughly 2,400 hidden tokens sent with each request and would otherwise make the comparison misleading.
+
+### Results
+
+![tau-bench benchmark results](results_chart.png)
 
 ![report output](screenshots/results.png)
 
-Tiered management solved three times as many tasks on a single attempt, and it was the only condition that solved anything reliably. Naive truncation never once passed the same task on both attempts, which is the number that matters for a production agent. An agent that succeeds on one try and fails the retry cannot be trusted, and that is exactly what delete-oldest produced.
+- **Managed solved 3x as many tasks** on a single attempt.
+- **Managed was the only condition to solve anything reliably.** Naive never passed the same task twice.
+- **Managed used more total context, not less**, because it engaged with the hardest task instead of failing fast.
 
-The managed agent used more total context, not less, which is worth explaining rather than hiding. It used more because it engaged with the hardest task in the set, downgrading five separate reservations with individual refunds, and worked it through to real tool calls instead of failing fast on something simpler. Reading the transcripts shows the extra spend is real work, with some redundant re-fetching of reservation details that had aged out of what the agent could act on. That re-fetching is itself an argument for the roadmap below. If the compressor understood that a reservation is still in play, it would keep it in view and the agent would not have to look it up twice.
+The additional context spend was real work. In the hardest task, involving downgrading five reservations with individual refunds, the managed agent continued making tool calls instead of failing early. Some additional context was also spent re-fetching reservation details that had aged out.
 
-A note on honesty of measurement. These are twenty episodes on a small model at temperature one, so the exact rates carry real variance and should be read as a clear direction rather than precise constants. The consistent finding across every run was the shape, tiered management holds constraints and structured fields under pressure that naive truncation drops, and that shows up as more reliable task completion.
+That behavior is itself useful evidence for the next iteration. Better context management should not only preserve important information, but also understand when information needs to remain available across a long tool-use trajectory.
 
-A context window turns out to be less a budget problem than an engineering one, which is the lesson the whole build kept returning to. The token limit is not what separates a good agent from a bad one. The logic that decides what survives under pressure is.
+These are twenty episodes on a small model at temperature one, so the rates carry variance and should be read as a direction rather than constants. The consistent finding across runs was the shape. Tiered management preserves constraints and structured fields under pressure that naive truncation can drop.
 
-## What is in the repo
+## Benchmark improvements
 
-| Path | What it is |
-|------|------------|
-| `context_tiers/manager.py` | the main class most users import |
-| `context_tiers/allocator.py` | the tiered budget math |
-| `context_tiers/summarizer.py` | field aware compression for structured tool output |
-| `context_tiers/pinner.py` | detects hard user constraints worth protecting |
-| `context_tiers/redis_store.py` | optional Redis backend so state survives restarts |
-| `adapter.py` | plugs the library into tau-bench for a fair head to head |
-| `runner.py` | benchmark runner with checkpointing, backoff, and resume |
-| `report.py` | computes pass^k and the comparison |
+Building the benchmark exposed three issues worth fixing.
 
-## Try it in two minutes
+### Tool schemas count toward the budget
+
+The context budget now includes tool schemas rather than counting only visible messages.
+
+This matters because tool definitions can consume a substantial portion of the available context window on every request.
+
+### Compression is field-aware
+
+Structured tool results are compressed by field rather than by raw token truncation.
+
+This allows important values such as IDs and payment records to survive compression.
+
+### Tool roles are preserved
+
+Historical tool results retain their original roles instead of being flattened into artificial user messages.
+
+This preserves the semantics of the original conversation when old context is reintroduced.
+
+## Repository
+
+```text
+context-tiers/
+├── context_tiers/
+│   ├── manager.py
+│   ├── allocator.py
+│   ├── summarizer.py
+│   ├── pinner.py
+│   └── redis_store.py
+│
+├── adapter.py
+├── runner.py
+├── inspect_episode.py
+├── demo.py
+└── ...
+```
+
+| Path | Purpose |
+|---|---|
+| `context_tiers/manager.py` | Main context manager |
+| `context_tiers/allocator.py` | Tiered budget allocation |
+| `context_tiers/summarizer.py` | Field-aware compression |
+| `context_tiers/pinner.py` | Hard-constraint detection |
+| `context_tiers/redis_store.py` | Optional Redis backend |
+| `adapter.py` | tau-bench integration |
+| `runner.py` | Benchmark runner with checkpointing and resume |
+| `inspect_episode.py` | Episode inspection and failure analysis |
+
+## Try it
 
 ```bash
 git clone https://github.com/AmulyaP07-15/context-tiers.git
 cd context-tiers
-python3 -m venv venv && source venv/bin/activate
+
+python3 -m venv venv
+source venv/bin/activate
+
 pip install -e ".[redis]"
 python demo.py
 ```
 
-The demo builds a conversation too big for its budget, runs it through the manager, and checks three things. The result fits the budget. The policy and the protected constraints survive untouched. Bulky tool output comes back shortened with its key fields intact.
+## Limitations
 
-## Roadmap
+The current constraint detector relies primarily on keyword and pattern matching.
 
-Three directions, in the order I would build them.
+That works for explicit instructions like these.
 
-Semantic relevance. Constraints are matched by keyword today, which catches most stated requirements but misses paraphrases like "charge it to my miles" when the pinned rule says "use miles not the card." The plan is a hybrid that runs a small embedding model alongside the keyword layer and keeps whichever signal fires. It stays an optional install so the library still works offline and dependency free by default, which matters for the CI and air gapped cases where a model download is not an option.
+```text
+"Pay with miles."
+"Don't use the credit card."
+```
 
-Constraint aware compression. The summarizer treats every field on its own right now. The stronger version links each constraint to the entities it names, so a payment id is protected because it is tied to a live "use miles not the card" instruction rather than because its key happened to match a protected pattern. That turns the flat store into a small graph of constraints and the facts they touch, and it lets compression reason about relevance instead of matching strings.
+but can miss paraphrases like this one.
 
-Provenance envelope. Every shortened tool result already reports what it kept and dropped through the trace. The next step is to carry that as structured metadata a downstream audit can read without re-parsing the text, so a system can prove after the fact which fields a decision was made on. This is groundwork for using the library where compression decisions have to be explainable.
+```text
+"Charge it to my miles."
+```
+
+The current benchmark is also intentionally small. The results demonstrate a direction rather than establishing a statistically conclusive performance difference.
+
+## v2
+
+### Semantic relevance
+
+Add an optional embedding model alongside the keyword-based constraint layer to detect semantically equivalent instructions while keeping the core library dependency-free by default.
+
+### Constraint-aware compression
+
+Link each detected constraint to the entities it refers to.
+
+Instead of simply protecting a field because its key matches a pattern, shown here,
+
+```text
+constraint → field
+```
+
+the system could model this instead.
+
+```text
+constraint
+    ↓
+entity
+    ↓
+facts
+    ↓
+fields
+```
+
+A payment ID could then remain protected because it is connected to an active payment constraint rather than because the field name happens to match a rule.
+
+### Provenance envelope
+
+Carry kept and dropped fields as structured metadata that downstream systems can inspect.
+
+This lets an application answer what context reached the model, and also what was removed before the model saw it and why.
 
 ## Built with
 
-Python, tiktoken for token counting, Redis optional, tau-bench and litellm for the benchmark harness. Tests and demos run in CI on every push.
+- Python
+- tiktoken
+- Redis (optional)
+- tau-bench
+- LiteLLM
+
+CI runs on every push.
