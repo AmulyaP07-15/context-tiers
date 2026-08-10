@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "context-tiers"
+version = "0.1.0"
+description = "Tiered token budget allocation for LLM agent context. Policy and constraints protected, spent tool results summarized, old turns truncated."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Amulya Penikalapati" }]
+dependencies = ["tiktoken>=0.5"]
+
+[project.optional-dependencies]
+redis = ["redis>=5", "fakeredis>=2"]
+bench = ["litellm", "matplotlib"]
+
+[project.urls]
+Homepage = "https://github.com/AmulyaP07-15/context-tiers"
+
+[tool.setuptools]
+packages = ["context_tiers"]
